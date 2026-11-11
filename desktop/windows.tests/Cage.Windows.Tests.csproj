@@ -15,6 +15,8 @@
     <EmbeddedResource Include="../../packaging/windows/verified-file-deletion.cs" LogicalName="Cage.VerifiedFileDeletion.cs" />
     <Compile Include="../windows/UpdatePolicy.cs" Link="UpdatePolicy.cs" />
     <Compile Include="../windows/Backend.cs" Link="Backend.cs" />
+    <Compile Include="../windows/NativeHelperLifetime.cs" Link="NativeHelperLifetime.cs" />
+    <EmbeddedResource Include="../windows/MainWindow.cs" LogicalName="Cage.MainWindow.Source.cs" />
     <Compile Include="../windows/UpdateRecovery.cs" Link="UpdateRecovery.cs" />
     <Compile Include="../windows/AppUpdater.cs" Link="AppUpdater.cs" />
     <Compile Include="../windows/UpdateInstaller.cs" Link="UpdateInstaller.cs" />

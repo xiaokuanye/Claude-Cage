@@ -69,27 +69,68 @@ function Assert-WindowsWorkbenchReport {
     }
 }
 
+function Save-WindowsWorkbenchPublicReport {
+    param([string]$Report, [string]$Destination, [int]$ExitCode = -1, $ProcessIdentity)
+    # An allowlist, not a copy of the raw report. Free text, screenshots, URLs,
+    # profile/configuration and helper output must never enter CI artifacts.
+    $public = [ordered]@{ schema = 1; exitCode = $ExitCode; reportState = 'missing'; success = $false; nativeBridgeReady = $false }
+    if (Test-Path -LiteralPath $Report -PathType Leaf) {
+        $public.reportState = 'invalid'
+        try {
+            if ((Get-Item -LiteralPath $Report).Length -gt 65536) { throw 'Oversized report' }
+            $raw = Get-Content -LiteralPath $Report -Raw | ConvertFrom-Json -AsHashtable
+            if ($raw -isnot [System.Collections.IDictionary]) { throw 'Invalid report' }
+            $public.reportState = 'parsed'
+            $public.success = $raw['success'] -eq $true
+            $public.nativeBridgeReady = $raw['nativeBridgeReady'] -eq $true
+            $phases = @('starting', 'initializing_webview', 'webview_initialized', 'starting_backend', 'backend_returned', 'loading_workbench', 'stopping_backend', 'stopping_browser', 'completed')
+            $public.phase = if ($raw['phase'] -in $phases) { $raw['phase'] } else { 'unknown' }
+            if ($raw['prepareExit'] -is [int] -or $raw['prepareExit'] -is [long]) { $public.prepareExit = $raw['prepareExit'] }
+            if ($raw['prepareStatus'] -in @('prepared', 'stop_required', 'error', 'unexpected')) { $public.prepareStatus = $raw['prepareStatus'] }
+            $public.errorCount = @($raw['errors'] | Where-Object { $null -ne $_ }).Count
+            # Empty on successful smoke does not establish full JS coverage.
+            $public.pageErrorsCaptured = $raw['page'] -is [System.Collections.IDictionary]
+            if ($public.pageErrorsCaptured) { $public.pageErrorCount = @($raw['page']['errors'] | Where-Object { $null -ne $_ }).Count }
+        } catch { $public.reportState = 'invalid' }
+    }
+    if ($ProcessIdentity) { $public.process = $ProcessIdentity }
+    [IO.File]::WriteAllText($Destination, ($public | ConvertTo-Json -Depth 4))
+}
+
 function Assert-WindowsWorkbench {
     param([Parameter(Mandatory)][string]$AppDirectory)
     if (-not $IsWindows) { throw 'Workbench acceptance requires Windows.' }
     $testRoot = Join-Path (Get-WindowsWorkbenchTestBase) ('cage-build-ui-' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $testRoot -Force | Out-Null
-    $report = Join-Path $testRoot 'smoke.json'
+    $privateRoot = Join-Path $testRoot 'private'
+    New-Item -ItemType Directory -Path $privateRoot | Out-Null
+    $report = Join-Path $privateRoot 'smoke.raw.json'
+    $publicReport = Join-Path $testRoot 'smoke.json'
+    Save-WindowsWorkbenchPublicReport -Report $report -Destination $publicReport
     $start = [Diagnostics.ProcessStartInfo]::new((Join-Path $AppDirectory 'Cage.exe'))
     $start.UseShellExecute = $false
     $start.WorkingDirectory = $AppDirectory
-    $start.Environment['CLAUDE_CAGE_CONFIG'] = Join-Path $testRoot 'profile/config.json'
+    $start.Environment['CLAUDE_CAGE_CONFIG'] = Join-Path $privateRoot 'profile/config.json'
     $start.ArgumentList.Add('--smoke-test')
     $start.ArgumentList.Add($report)
-    $window = [Diagnostics.Process]::Start($start)
+    $window = $null
+    $processIdentity = $null
+    $exitCode = -1
     $passed = $false
     try {
+        $window = [Diagnostics.Process]::Start($start)
+        $processIdentity = @{ pid = $window.Id; parentPid = $PID; startUtc = $window.StartTime.ToUniversalTime().ToString('o'); imagePath = $start.FileName; exited = $false }
         if (-not $window.WaitForExit(180000)) { throw "Cage workbench acceptance timed out. Diagnostics retained at $testRoot" }
+        $exitCode = $window.ExitCode
         Assert-WindowsWorkbenchReport -ExitCode $window.ExitCode -Report $report
         $passed = $true
     } finally {
-        if (-not $window.HasExited) { $window.Kill($true); $window.WaitForExit() }
-        $window.Dispose()
+        if ($window) {
+            if (-not $window.HasExited) { $window.Kill($true); $window.WaitForExit() }
+            if ($processIdentity) { $processIdentity.exited = $window.HasExited }
+            $window.Dispose()
+        }
+        Save-WindowsWorkbenchPublicReport -Report $report -Destination $publicReport -ExitCode $exitCode -ProcessIdentity $processIdentity
         if (-not $passed) {
             # Close only this test's authenticated controller. Killing every
             # cage.exe could terminate another installed application or VM.
@@ -99,7 +140,7 @@ function Assert-WindowsWorkbench {
                 $cleanup.CreateNoWindow = $true
                 $cleanup.RedirectStandardOutput = $true
                 $cleanup.RedirectStandardError = $true
-                $cleanup.Environment['CLAUDE_CAGE_CONFIG'] = Join-Path $testRoot 'profile/config.json'
+                $cleanup.Environment['CLAUDE_CAGE_CONFIG'] = Join-Path $privateRoot 'profile/config.json'
                 $cleanup.ArgumentList.Add('prepare-update'); $cleanup.ArgumentList.Add('--json')
                 $controller = [Diagnostics.Process]::Start($cleanup)
                 try {
@@ -110,9 +151,10 @@ function Assert-WindowsWorkbench {
                 } finally { $controller.Dispose() }
             } catch { Write-Warning "Isolated smoke cleanup failed: $($_.Exception.Message)" }
         }
-        # A successful smoke report is written only after the isolated backend
-        # confirms shutdown. Failed profiles remain available for diagnosis.
-        if ($passed) { Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue }
+        # Keep the public bounded smoke report through the complete build/job,
+        # including a later relocation failure. Private failures stay local.
+        if ($passed) { Remove-Item -LiteralPath $privateRoot -Recurse -Force -ErrorAction SilentlyContinue }
+        Write-Host "Public workbench report retained: $publicReport"
     }
 }
 

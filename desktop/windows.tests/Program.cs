@@ -1,5 +1,7 @@
 using Cage.Windows;
 
+if (await NativeHelperTests.RunFixture(args)) return;
+
 if (args is ["smoke-wait", var smokeRelease])
 {
     using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(10));
@@ -201,7 +203,7 @@ try
                 File.WriteAllText(record, System.Text.Json.JsonSerializer.Serialize(new { pid = owned.Id }));
                 controllers = Backend.CaptureSmokeControllers();
                 Check(controllers.Count == 1 && !controllers[0].HasExited, "smoke did not pin its live controller");
-                var exit = controllers[0].WaitForExitAsync();
+                var exit = NativeHelperLifetime.WaitForProcessExitAsync(controllers[0], CancellationToken.None);
                 Check(!exit.IsCompleted, "smoke considered a still-running controller stopped");
                 File.WriteAllText(release, "release owned child");
                 await exit.WaitAsync(TimeSpan.FromSeconds(5));
@@ -229,11 +231,23 @@ try
         await Task.Delay(100);
         Check(File.ReadAllText(Path.Combine(Backend.Root, "retry-invocations")) == "x", "native check/install bypassed server cooldown");
         Console.WriteLine("Windows updater protocol: real subprocess preserved deadline; early check/install blocked.");
+        // This closes Backend's admission permanently, so keep it last.
+        await NativeHelperTests.Run(integration, executable);
+    }
+    catch (Exception error)
+    {
+        Console.Error.WriteLine("Native fixture operation failure: " + error);
+        throw;
     }
     finally
     {
         Environment.SetEnvironmentVariable("CAGE_UPDATE_RETRY_AT", savedRetry);
-        Directory.Delete(nativeResources, true);
+        try { Directory.Delete(nativeResources, true); }
+        catch (UnauthorizedAccessException error)
+        {
+            NativeCleanupDiagnostics.Capture(Path.Combine(nativeResources, "cage.exe"), error);
+            throw;
+        }
     }
 }
 finally {

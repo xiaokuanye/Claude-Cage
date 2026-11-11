@@ -109,7 +109,7 @@ jobs:
           path: |
             ${{ runner.temp }}/cage-smoke-*.json
             ${{ runner.temp }}/cage-build-ui-*/smoke.json
-            ${{ runner.temp }}/cage-build-ui-*/*.png
+            ${{ runner.temp }}/cage-build-diagnostics-*/diagnostics.json
           if-no-files-found: ignore
           overwrite: true
           retention-days: 14
@@ -229,7 +229,7 @@ jobs:
           path: |
             ${{ runner.temp }}/cage-smoke-*.json
             ${{ runner.temp }}/cage-build-ui-*/smoke.json
-            ${{ runner.temp }}/cage-build-ui-*/*.png
+            ${{ runner.temp }}/cage-build-diagnostics-*/diagnostics.json
           if-no-files-found: ignore
           retention-days: 14
       # The caller owns publication. This workflow has no repository write access.

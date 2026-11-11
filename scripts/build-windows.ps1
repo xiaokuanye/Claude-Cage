@@ -8,6 +8,7 @@ param(
     [string]$DependencyCache
 )
 . (Join-Path $PSScriptRoot 'windows-common.ps1')
+. (Join-Path $PSScriptRoot 'windows-build-move.ps1')
 $repository = Split-Path $PSScriptRoot -Parent
 if (-not $OutputDirectory) { $OutputDirectory = Join-Path $repository '_output/windows-amd64/app' }
 if (-not $DependencyCache) { $DependencyCache = Join-Path $repository '_output/windows-deps' }
@@ -25,6 +26,8 @@ $dependencies = Get-Content -LiteralPath (Join-Path $repository 'packaging/windo
 $stage = Join-Path $repository ("_output/windows-build-" + [guid]::NewGuid().ToString('N'))
 $savedGoOS, $savedGoArch, $savedCGO = $env:GOOS, $env:GOARCH, $env:CGO_ENABLED
 New-Item -ItemType Directory -Path $stage -Force | Out-Null
+$buildCompleted = $false
+$moveEvidence = $null
 Push-Location $repository
 try {
     if (-not $SkipUI) {
@@ -176,6 +179,7 @@ try {
     } else {
         [IO.File]::WriteAllText((Join-Path $app 'DEVELOPMENT-BUILD.txt'), "Unsigned development build. Automatic update installation is disabled. Windows 10/11 runtime acceptance is still required.`n")
     }
+    $moveEvidence = New-WindowsBuildMoveEvidence -StageDirectory $stage
     Assert-WindowsWorkbench $app
     $previousOutput = $null
     if (Test-Path -LiteralPath $OutputDirectory) {
@@ -187,17 +191,22 @@ try {
         Move-Item -LiteralPath $OutputDirectory -Destination $previousOutput
     }
     New-Item -ItemType Directory -Path (Split-Path $OutputDirectory -Parent) -Force | Out-Null
-    try { Move-Item -LiteralPath $app -Destination $OutputDirectory }
+    try { Move-WindowsBuildApp -Evidence $moveEvidence -Destination $OutputDirectory }
     catch {
         if ($previousOutput -and -not (Test-Path -LiteralPath $OutputDirectory)) { Move-Item -LiteralPath $previousOutput -Destination $OutputDirectory }
         throw
     }
     if ($previousOutput) { Remove-Item -LiteralPath $previousOutput -Recurse -Force }
+    $buildCompleted = $true
     Write-Host "Built Windows x64 application: $OutputDirectory"
+} catch {
+    if ($moveEvidence) { Save-WindowsBuildMoveEvidence $moveEvidence 'build_failed' }
+    Write-Warning "Failed build stage retained locally: $stage. Do not upload the stage or private smoke profiles."
+    throw
 } finally {
     Pop-Location
     $env:GOOS = $savedGoOS; $env:GOARCH = $savedGoArch; $env:CGO_ENABLED = $savedCGO
-    if (Test-Path -LiteralPath $stage) {
+    if ($buildCompleted -and (Test-Path -LiteralPath $stage)) {
         try { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction Stop }
         catch { Write-Warning "Temporary build files remain at $stage. Cleanup did not complete: $($_.Exception.Message)" }
     }

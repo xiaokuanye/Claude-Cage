@@ -18,6 +18,7 @@ internal sealed class MainWindow : Form
     private int expectedPort;
     private bool controllerNeedsUpdate, allowQuit, bootstrapping, webFailed;
     private bool completingSmoke;
+    private Task? initializingWebView;
     private string smokePhase = "starting";
     private readonly CancellationTokenSource lifetime = new();
     private readonly Dictionary<string, (string[] Paths, DateTime Expires)> fileSelections = new();
@@ -41,7 +42,8 @@ internal sealed class MainWindow : Form
         };
         var trayMenu = new TrayMenu();
         trayMenu.Items.Add("打开 Cage", null, (_, _) => RestoreWindow());
-        trayMenu.Items.Add("检查应用更新…", null, (_, _) => updater!.Handle("check"));
+        var checkUpdate = trayMenu.Items.Add("检查应用更新…", null, (_, _) => HandleUpdate("check"));
+        checkUpdate.Enabled = Program.SmokeOutput == null;
         trayMenu.Items.Add("关于 Cage", null, (_, _) => MessageBox.Show(this, $"Cage {AppUpdater.Version}\n本机隔离编码工作区", "关于 Cage"));
         trayMenu.Items.Add(new ToolStripSeparator());
         trayMenu.Items.Add("退出 Cage…", null, (_, _) => RequestQuit());
@@ -141,6 +143,14 @@ internal sealed class MainWindow : Form
         if (state.TryGetValue("phase", out var phase) && phase as string == "failed") _ = Backend.Report("App update failed: " + state.GetValueOrDefault("message"));
         Script("window.dispatchEvent(new CustomEvent('cage-app-update',{detail:" + JsonSerializer.Serialize(state) + "}));");
     }
+    private Dictionary<string, object?> HandleUpdate(string operation)
+    {
+        // A packaging smoke may inspect update status, never download/install
+        // an application (or start the updater's separate streamed helpers).
+        if (Program.SmokeOutput != null && operation != "status")
+            return new() { ["phase"] = "idle", ["message"] = "自检期间不执行应用更新" };
+        return updater.Handle(operation);
+    }
     private async void Script(string script)
     {
         if (web.IsDisposed || web.CoreWebView2 == null || IsDisposed) return;
@@ -163,6 +173,7 @@ internal sealed class MainWindow : Form
 
     private async Task Initialize(bool recreate = false)
     {
+        if (completingSmoke) return;
         smokePhase = "initializing_webview";
         retry.Enabled = false;
         try
@@ -173,8 +184,9 @@ internal sealed class MainWindow : Form
                 web = new WebView2 { Dock = DockStyle.Fill, Visible = false };
                 Controls.Add(web); status.BringToFront();
             }
-            var environment = await CoreWebView2Environment.CreateAsync(null, Path.Combine(Backend.Root, "webview2"));
-            await web.EnsureCoreWebView2Async(environment);
+            initializingWebView = InitializeWebView();
+            await initializingWebView;
+            if (completingSmoke) return;
             smokePhase = "webview_initialized";
             var core = web.CoreWebView2;
             core.Settings.AreDevToolsEnabled = false; core.Settings.AreDefaultContextMenusEnabled = false;
@@ -209,8 +221,15 @@ internal sealed class MainWindow : Form
             Error("缺少 Microsoft Edge WebView2 Runtime。请运行 Cage 安装程序安装随附运行时后重试。");
             webFailed = true;
         }
-        catch (Exception error) { webFailed = true; Error("无法初始化工作台：" + error.Message); }
+        catch (Exception error) { if (!completingSmoke) { webFailed = true; Error("无法初始化工作台：" + error.Message); } }
         finally { retry.Enabled = true; }
+    }
+
+    private async Task InitializeWebView()
+    {
+        var environment = await CoreWebView2Environment.CreateAsync(null, Path.Combine(Backend.Root, "webview2"));
+        if (completingSmoke) return;
+        await web.EnsureCoreWebView2Async(environment);
     }
 
     private async Task SmokeDeadline()
@@ -223,38 +242,48 @@ internal sealed class MainWindow : Form
     {
         if (Program.SmokeOutput == null || completingSmoke) return;
         completingSmoke = true;
+        Backend.CloseSmokeAdmission();
         JsonElement? page = null;
-        var pageURL = web.Source?.GetLeftPart(UriPartial.Path);
-        var environment = web.CoreWebView2?.Environment;
-        var webviewVersion = environment?.BrowserVersionString;
+        CoreWebView2Environment? environment = null;
+        string? webviewVersion = null;
         using var shutdown = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
-        shutdown.CancelAfter(TimeSpan.FromSeconds(20));
         var errors = new List<string>();
         int? prepareExit = null;
         string? prepareStatus = null;
         if (failure != null) errors.Add(failure);
+        if (initializingWebView != null)
+        {
+            try { await initializingWebView.WaitAsync(TimeSpan.FromSeconds(5)); }
+            catch (Exception error) { errors.Add("自检初始化未完成：" + error.GetType().Name); }
+        }
+        environment = web.CoreWebView2?.Environment;
+        webviewVersion = environment?.BrowserVersionString;
         try
         {
-            if (!nativeBridgeReady && web.CoreWebView2 != null)
+            if (web.CoreWebView2 != null)
             {
                 try
                 {
-                    var snapshot = await web.CoreWebView2.ExecuteScriptAsync("({title:document.title,ready:document.readyState,text:(document.body?.innerText||'').slice(0,4096),errors:window.__cageSmokeErrors||[]})");
+                    var snapshot = await web.CoreWebView2.ExecuteScriptAsync("({ready:document.readyState,errors:(window.__cageSmokeErrors||[]).slice(0,8)})")
+                        .WaitAsync(TimeSpan.FromSeconds(3));
                     page = JsonDocument.Parse(snapshot).RootElement.Clone();
-                    await using var capture = File.Create(Path.ChangeExtension(Program.SmokeOutput, ".png"));
-                    await web.CoreWebView2.CapturePreviewAsync(CoreWebView2CapturePreviewImageFormat.Png, capture);
                 }
-                catch (Exception error) { errors.Add("无法保存工作台画面：" + error.Message); }
+                catch (Exception error) { errors.Add("无法采集工作台错误状态：" + error.GetType().Name); }
             }
+            // Finish all admitted desktop/diagnostic CLI calls before reading
+            // control.json: a late refresh can publish a new controller record.
+            if (!await Backend.DrainSmokeHelpers(TimeSpan.FromSeconds(5)))
+                errors.Add("自检辅助请求超时，已取消并确认退出");
+            shutdown.CancelAfter(TimeSpan.FromSeconds(20));
             var controllers = Backend.CaptureSmokeControllers();
             try
             {
                 if (nativeBridgeReady) smokePhase = "stopping_backend";
-                var (exit, data) = await Backend.Json(["prepare-update", "--json"], shutdown.Token, TimeSpan.FromSeconds(20));
+                var (exit, data) = await Backend.PrepareSmokeShutdown(shutdown.Token);
                 prepareExit = exit;
                 prepareStatus = data.Text("status") is "prepared" or "stop_required" or "error" ? data.Text("status") : "unexpected";
                 if (exit != 0 || data.Text("status") != "prepared") throw new IOException("自检结束时无法确认后台已停止");
-                await Task.WhenAll(controllers.Select(process => process.WaitForExitAsync(shutdown.Token)));
+                await Task.WhenAll(controllers.Select(process => NativeHelperLifetime.WaitForProcessExitAsync(process, shutdown.Token)));
             }
             finally { foreach (var process in controllers) process.Dispose(); }
         }
@@ -266,22 +295,24 @@ internal sealed class MainWindow : Form
             var exited = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             void BrowserExited(object? sender, CoreWebView2BrowserProcessExitedEventArgs args) => exited.TrySetResult();
             environment.BrowserProcessExited += BrowserExited;
+            using var browserShutdown = new CancellationTokenSource(TimeSpan.FromSeconds(20));
             try
             {
                 if (nativeBridgeReady && errors.Count == 0) smokePhase = "stopping_browser";
                 web.Dispose();
-                await exited.Task.WaitAsync(shutdown.Token);
+                await exited.Task.WaitAsync(browserShutdown.Token);
             }
             catch (Exception error) { errors.Add("自检浏览器尚未退出：" + error.Message); }
             finally { environment.BrowserProcessExited -= BrowserExited; }
         }
+        else web.Dispose(); // Also release a controller whose initialization failed/timed out.
         try
         {
             if (nativeBridgeReady && errors.Count == 0) smokePhase = "completed";
             File.WriteAllText(Program.SmokeOutput, JsonSerializer.Serialize(new {
                 success = nativeBridgeReady && errors.Count == 0, nativeBridgeReady, version = AppUpdater.Version,
                 phase = smokePhase, nativeStatus = message.Text, prepareExit, prepareStatus, errors, page,
-                pageURL, webviewVersion,
+                webviewVersion,
                 windowBounds = Bounds, workingArea = Screen.FromHandle(Handle).WorkingArea, deviceDpi = DeviceDpi,
                 nativeMenuBar = MainMenuStrip != null,
             }));
@@ -292,7 +323,7 @@ internal sealed class MainWindow : Form
 
     private async Task Bootstrap(params string[] options)
     {
-        if (bootstrapping || web.CoreWebView2 == null) return;
+        if (completingSmoke || bootstrapping || web.CoreWebView2 == null) return;
         bootstrapping = true;
         message.Text = "正在连接 Cage 工作台…"; status.Show(); status.BringToFront();
         retry.Hide(); existing.Hide(); complete.Hide();
@@ -300,6 +331,7 @@ internal sealed class MainWindow : Form
         {
             smokePhase = "starting_backend";
             var (exit, data) = await Backend.Json(["desktop", "--json", ..options], lifetime.Token);
+            if (completingSmoke) return;
             smokePhase = "backend_returned";
             if (exit != 0) throw new IOException(data.Text("message") is { Length: > 0 } detail ? detail : "工作台未能启动");
             controllerNeedsUpdate = data.Text("status") != "ready";
@@ -312,8 +344,9 @@ internal sealed class MainWindow : Form
             Text = controllerNeedsUpdate ? "Cage（更新待完成）" : "Cage";
             web.CoreWebView2.Navigate(entry.AbsoluteUri);
         }
-        catch (OperationCanceledException) { if (!lifetime.IsCancellationRequested) Error("启动工作台失败：等待本机后台响应超时。请点击“重试连接”；仍失败时请保留此提示并反馈给维护者。"); }
+        catch (OperationCanceledException) { if (!completingSmoke && !lifetime.IsCancellationRequested) Error("启动工作台失败：等待本机后台响应超时。请点击“重试连接”；仍失败时请保留此提示并反馈给维护者。"); }
         catch (Exception error) {
+            if (completingSmoke) return;
             _ = Backend.Report("Workbench startup failed: " + error);
             Error(error.Message.Any(c => c is >= '\u4E00' and <= '\u9FFF') ? error.Message : "启动工作台失败：本机后台未返回可识别的原因（错误类型 " + error.GetType().Name + "）。请点击“重试连接”；仍失败时请保留此提示并反馈给维护者。");
         }
@@ -352,6 +385,7 @@ internal sealed class MainWindow : Form
             var body = envelope.RootElement;
             id = body.Text("id");
             if (!Guid.TryParse(id, out _)) return;
+            if (completingSmoke) throw new InvalidOperationException("自检正在关闭，不再接受原生请求");
             // Match the Linux bridge envelope limit. A 20 MiB PNG needs about
             // 27 MiB after Base64 encoding; retain the ID to reply on rejection.
             if (message.Length > 30 * 1024 * 1024) throw new InvalidDataException("请求内容过大，请减少图片或文本内容后重试");
@@ -373,7 +407,7 @@ internal sealed class MainWindow : Form
                 case "workbenchReady":
                     if (controllerNeedsUpdate) throw new IOException("后台版本尚未同步，更新未完成");
                     updater.MarkReady(); result = true; _ = CompleteSmoke(); break;
-                case "appUpdate": result = updater.Handle(request.Text("operation")); break;
+                case "appUpdate": result = HandleUpdate(request.Text("operation")); break;
                 case "importTheme":
                     using (var picker = new OpenFileDialog { Filter = "Cage 主题 (*.json)|*.json", Title = "导入主题", Multiselect = false })
                     {
@@ -523,7 +557,7 @@ internal sealed class MainWindow : Form
         }
         catch (Exception error)
         {
-            _ = Backend.Report(error.ToString());
+            if (!completingSmoke) _ = Backend.Report(error.ToString());
             if (id.Length != 0 && !IsDisposed && !web.IsDisposed) web.CoreWebView2.PostWebMessageAsJson(JsonSerializer.Serialize(new { id, error = error.Message }));
         }
     }
@@ -533,33 +567,18 @@ internal sealed class MainWindow : Form
           if (window !== window.top || location.protocol !== 'http:' || location.hostname !== 'localhost') return;
           const errors = [];
           Object.defineProperty(window, '__cageSmokeErrors', { value: errors });
-          const ownPath = value => {
-            try { const url = new URL(value, location.href); return url.origin === location.origin ? url.pathname : ''; }
-            catch { return ''; }
-          };
-          const scrub = value => {
-            let text = String(value || '');
-            for (const input of document.querySelectorAll('input,textarea'))
-              if (input.value) text = text.split(input.value).join('[form-value]');
-            return text.replace(/https?:\/\/[^\s"'<>`]+/g, value => ownPath(value) || '[external]')
-              .replace(/[?#][^\s"'<>)]*/g, '[redacted]').slice(0, 768);
-          };
-          const stack = error => String(error?.stack || '').split('\n').slice(1)
-            .filter(line => line.includes(location.origin + '/')).slice(0, 6).map(scrub);
+          // Export classifications only. Error messages, stacks, URLs and page
+          // content can contain credentials/user text even after URL scrubbing.
           const record = value => { if (errors.length < 8) errors.push(value); };
           addEventListener('error', event => {
             if (event.target instanceof HTMLScriptElement || event.target instanceof HTMLLinkElement) {
-              const source = ownPath(event.target.src || event.target.href);
-              if (source) record({ type: 'module-load', source });
+              record({ type: 'module-load', message: 'Resource load failed' });
               return;
             }
-            const source = ownPath(event.filename || location.href);
-            if (source) record({ type: 'error', source, message: scrub(event.message), stack: stack(event.error) });
+            record({ type: 'error', message: 'JavaScript error' });
           }, true);
           addEventListener('unhandledrejection', event => {
-            const frames = stack(event.reason);
-            // Primitive/cross-origin rejections are counted without exporting arbitrary values.
-            record({ type: 'unhandledrejection', message: frames.length ? scrub(event.reason?.message) : 'Unhandled rejection', stack: frames });
+            record({ type: 'unhandledrejection', message: 'Unhandled rejection' });
           });
         })();
         """;

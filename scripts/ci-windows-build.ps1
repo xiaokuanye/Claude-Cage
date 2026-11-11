@@ -52,6 +52,7 @@ try {
     Invoke-BuildTool 'node' @('scripts/check-version.mjs')
     Invoke-BuildTool 'node' @('--test', 'internal/cage/browser-clipboard.test.mjs', 'scripts/windows-native-bridge.test.mjs')
     Invoke-BuildTool (Get-BuildCommand @('pwsh.exe', 'pwsh')) @('-NoProfile', '-NonInteractive', '-File', 'scripts/windows-workbench-smoke.test.ps1')
+    Invoke-BuildTool (Get-BuildCommand @('pwsh.exe', 'pwsh')) @('-NoProfile', '-NonInteractive', '-File', 'scripts/windows-build-move.test.ps1')
     $windowsPowerShell = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell/v1.0/powershell.exe'
     # NSIS is x86 and resolves $SYSDIR to SysWOW64. Match its real helper host.
     $installationPowerShell = Join-Path $env:SystemRoot 'SysWOW64/WindowsPowerShell/v1.0/powershell.exe'

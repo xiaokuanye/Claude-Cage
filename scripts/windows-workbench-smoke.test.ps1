@@ -5,6 +5,14 @@ New-Item -ItemType Directory -Path $directory | Out-Null
 $savedRunnerTemp = $env:RUNNER_TEMP
 function Assert-SmokeContract([bool]$Condition, [string]$Message) { if (-not $Condition) { throw $Message } }
 try {
+    $workflow = Get-Content -LiteralPath (Join-Path $PSScriptRoot '../.github/workflows/windows-build.yml') -Raw
+    $publicBlocks = [regex]::Matches($workflow, '(?ms)^      - name: Preserve public (?:test|release acceptance) reports\r?\n.*?^          path: \|\r?\n(?<paths>(?:            [^\r\n]+\r?\n)+)')
+    Assert-SmokeContract ($publicBlocks.Count -eq 2) 'Expected development and release public-report artifact blocks.'
+    $expectedPublicPaths = @('${{ runner.temp }}/cage-smoke-*.json', '${{ runner.temp }}/cage-build-ui-*/smoke.json', '${{ runner.temp }}/cage-build-diagnostics-*/diagnostics.json')
+    foreach ($block in $publicBlocks) {
+        $paths = @($block.Groups['paths'].Value -split '\r?\n' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        Assert-SmokeContract ($paths.Count -eq $expectedPublicPaths.Count -and @($paths | Where-Object { $_ -notin $expectedPublicPaths }).Count -eq 0) 'Public artifact paths must use the exact safe allowlist, never private trees or screenshots.'
+    }
     $env:RUNNER_TEMP = Join-Path $directory 'runner-temp'
     Assert-SmokeContract ((Get-WindowsWorkbenchTestBase) -eq [IO.Path]::GetFullPath($env:RUNNER_TEMP)) 'CI report directory ignores RUNNER_TEMP.'
     $savedTemp = $env:TEMP; $savedTmp = $env:TMP
@@ -65,7 +73,33 @@ try {
     $rejected = $false
     try { Assert-WindowsWorkbenchReport -ExitCode 17 -Report $report } catch { $rejected = $true }
     Assert-SmokeContract $rejected 'Nonzero child exit was accepted because its report said success.'
+    $public = Join-Path $directory 'public-smoke.json'
+    # Successful smoke must remain available when the later packaging step fails.
+    $privateRoot = New-Item -ItemType Directory -Path (Join-Path $directory 'private')
+    $privateReport = Join-Path $privateRoot.FullName 'smoke.raw.json'
+    [IO.File]::WriteAllText((Join-Path $privateRoot.FullName 'config.json'), '{"token":"private-profile-token"}')
+    @{
+        success = $true; nativeBridgeReady = $true; phase = 'completed'; prepareExit = 0; prepareStatus = 'prepared'
+        nativeStatus = 'Bearer private-bearer-token'; entryJSON = 'private-entry'; pageURL = 'http://localhost/?token=private-url-token'
+        errors = @('private-error-token'); page = @{ text = 'private-page-body'; errors = @(@{ message = 'private-js-token' }) }
+    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $privateReport
+    Save-WindowsWorkbenchPublicReport -Report $privateReport -Destination $public -ExitCode 0
+    Remove-Item -LiteralPath $privateRoot.FullName -Recurse -Force
+    $publicText = Get-Content -LiteralPath $public -Raw
+    $publicData = $publicText | ConvertFrom-Json
+    Assert-SmokeContract ($publicData.success -and $publicData.phase -eq 'completed' -and $publicData.prepareExit -eq 0) 'Successful smoke evidence was lost after private cleanup.'
+    Assert-SmokeContract ($publicData.errorCount -eq 1 -and $publicData.pageErrorCount -eq 1) 'Public evidence lost safe diagnostic counts.'
+    Assert-SmokeContract (-not $publicText.Contains('private-')) 'Public smoke artifact leaked private values.'
+    Assert-SmokeContract (@($publicData.PSObject.Properties.Name | Where-Object { $_ -in @('nativeStatus', 'entryJSON', 'pageURL', 'page', 'errors') }).Count -eq 0) 'Public artifact includes free-text fields.'
+    [IO.File]::WriteAllText($report, ('x' * 65537))
+    Save-WindowsWorkbenchPublicReport -Report $report -Destination $public -ExitCode 17
+    Assert-SmokeContract ((Get-Content $public -Raw | ConvertFrom-Json).reportState -eq 'invalid') 'Oversized raw report escaped the bounded public contract.'
+    Remove-Item -LiteralPath $report
+    Save-WindowsWorkbenchPublicReport -Report $report -Destination $public -ExitCode -1
+    Assert-SmokeContract ((Get-Content $public -Raw | ConvertFrom-Json).reportState -eq 'missing') 'Missing smoke report has no public diagnostic.'
     Write-Output 'PASS: RUNNER_TEMP/local selection, real failed child with existing diagnostic, safe evidence logging, and success/exit contract.'
+    Write-Output 'PASS: successful public smoke survives private cleanup; profile, tokens and free text omitted; oversized/missing reports remain bounded.'
+    Write-Output 'PASS: development/release artifact paths use the identical public JSON allowlist, without private trees or PNG globs.'
 } finally {
     $env:RUNNER_TEMP = $savedRunnerTemp
     Remove-Item -LiteralPath $directory -Recurse
