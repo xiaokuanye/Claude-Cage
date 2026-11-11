@@ -10,7 +10,10 @@ import path from "node:path";
 const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.CAGE_PLAYWRIGHT_MODULE || "playwright");
 const root = fileURLToPath(new URL("../", import.meta.url));
-const origin = "http://127.0.0.1:51234";
+const origin = "http://localhost:51234";
+const nativeBridge = (await readFile(new URL("../../desktop/windows/NativeBridge.cs", import.meta.url), "utf8"))
+  .match(/internal const string Script = """\s*([\s\S]*?)\s*""";/)?.[1];
+assert.ok(nativeBridge, "production Windows native bridge must be available");
 const browser = await chromium.launch({
   headless: true,
   executablePath: process.env.CAGE_TEST_BROWSER_PATH,
@@ -55,7 +58,7 @@ async function fixture(platform) {
     }
   });
   await page.goto(`${origin}/caps-lock-smoke`);
-  await page.evaluate(async (platform) => {
+  await page.evaluate(async ({ platform, nativeBridge }) => {
     const [{ default: RFB }, { default: Keyboard }, { installRemoteInput }] = await Promise.all([
       import("/.generated/novnc/core/rfb.js"),
       import("/.generated/novnc/core/input/keyboard.js"),
@@ -78,12 +81,24 @@ async function fixture(platform) {
       flush() { packets.push(bytes); bytes = []; },
     };
     window.cageNativeIMEAvailable = true;
-    window.webkit = { messageHandlers: { cage: { postMessage: async (value) => {
+    const nativeRequest = async (value) => {
       if (value.action === "clipboardRevision") return 0;
       if (value.action !== "remoteInput") throw new Error(`Unexpected native operation: ${value.action}`);
       requests.push(value);
       return true;
-    } } } };
+    };
+    let publishInput = detail => window.dispatchEvent(new CustomEvent("cage-native-input", { detail }));
+    if (platform === "Win32") {
+      let receive;
+      window.chrome.webview = {
+        addEventListener: (_, callback) => { receive = callback; },
+        postMessage: ({ id, request }) => {
+          nativeRequest(request).then(result => receive({ data: { id, result } }));
+        },
+      };
+      window.eval(nativeBridge);
+      publishInput = detail => receive({ data: { type: "cage-native-input", detail } });
+    } else window.webkit = { messageHandlers: { cage: { postMessage: nativeRequest } } };
     const input = installRemoteInput({
       events: rfb,
       setKeyboardTarget: (target) => rfb.cageSetKeyboardTarget(target),
@@ -118,7 +133,7 @@ async function fixture(platform) {
             // A server LED-state reply arrives after the CapsLock press.
             rfb._remoteCapsLock = value.feedback;
           } else {
-            window.dispatchEvent(new CustomEvent("cage-native-input", { detail: { owner, ...value } }));
+            publishInput({ owner, ...value });
           }
         }
         return {
@@ -131,7 +146,7 @@ async function fixture(platform) {
         };
       },
     };
-  }, platform);
+  }, { platform, nativeBridge });
   await page.waitForFunction(() => probe.requests.some((value) => value.operation === "activate"));
   return page;
 }
@@ -186,7 +201,12 @@ try {
         `Windows ${caps ? "CapsLock+Shift lowercase" : "Shift uppercase"} preserves modifiers (${suffix})`, qemu);
     }
   }
+  const stale = await windows.evaluate(sequence => probe.run({ remoteCapsLock: false, sequence }),
+    keyPair("a", "KeyA", false).map(value => ({ ...value, owner: "old-owner" })));
+  expectKeys(stale, [], "structured Windows input rejects stale owners", false);
   await windows.evaluate(() => probe.input.dispose());
+  const disposed = await windows.evaluate(sequence => probe.run({ remoteCapsLock: false, sequence }), keyPair("a", "KeyA", false));
+  expectKeys(disposed, [], "structured Windows input is ignored after disposal", false);
   await windows.close();
 
   const mac = await fixture("MacIntel");
