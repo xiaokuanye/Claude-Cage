@@ -2,6 +2,7 @@ package workbench
 
 import (
 	"bufio"
+	"compress/flate"
 	"context"
 	"encoding/json"
 	"errors"
@@ -99,12 +100,16 @@ func (s *Server) audio(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) streamAudio(w http.ResponseWriter, r *http.Request, source io.ReadCloser) {
 	defer source.Close()
-	ws, err := s.upgrade(w, r)
+	ws, err := s.upgradeWithCompression(w, r, true)
 	if err != nil {
 		return
 	}
 	defer ws.Close()
 	ws.SetReadLimit(1024)
+	if err := ws.SetCompressionLevel(flate.BestSpeed); err != nil {
+		return
+	}
+	ws.EnableWriteCompression(false)
 	_ = ws.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	if ws.WriteJSON(audioFormat) != nil {
 		return
@@ -118,7 +123,9 @@ func (s *Server) streamAudio(w http.ResponseWriter, r *http.Request, source io.R
 		_ = sendAudioPCM(ws, source)
 	}()
 	defer func() { _ = source.Close(); _ = ws.Close(); <-done }()
-	_, _, _ = ws.ReadMessage()
+	// The stream is output-only. Do not read/decompress incoming data: a wire
+	// read limit alone does not bound the expanded size of a compressed message.
+	_, _, _ = ws.NextReader()
 }
 
 func sendAudioPCM(ws *websocket.Conn, source io.Reader) error {
@@ -127,6 +134,11 @@ func sendAudioPCM(ws *websocket.Conn, source io.Reader) error {
 		n, err := io.ReadFull(source, packet)
 		n -= n % 4
 		if n > 0 {
+			// Preserve every 20 ms packet, including quiet gaps and very soft
+			// sounds. Dropping silent packets changes the old player's timeline.
+			// Only exact zeroes are compressed, avoiding codec cost for music or
+			// noise; clients without the extension still receive identical PCM.
+			ws.EnableWriteCompression(audioPCMSilent(packet[:n]))
 			_ = ws.SetWriteDeadline(time.Now().Add(2 * time.Second))
 			if writeErr := ws.WriteMessage(websocket.BinaryMessage, packet[:n]); writeErr != nil {
 				return writeErr
@@ -136,4 +148,13 @@ func sendAudioPCM(ws *websocket.Conn, source io.Reader) error {
 			return err
 		}
 	}
+}
+
+func audioPCMSilent(packet []byte) bool {
+	for _, b := range packet {
+		if b != 0 {
+			return false
+		}
+	}
+	return true
 }
