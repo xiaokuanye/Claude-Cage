@@ -1,6 +1,10 @@
-import { spawn } from "node:child_process";
+import { spawn, execFile } from "node:child_process";
 import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { promisify } from "node:util";
+import { setTimeout as pause } from "node:timers/promises";
+
+const runFile = promisify(execFile);
 
 // Chromium applies an XSETTINGS density in steps of 1/64.
 export function displayDensity(value) {
@@ -16,8 +20,13 @@ export function densitySettings(scale) {
 // change without restarting. Each viewer can then have the density of its own
 // screen. Without xsettingsd the display keeps the density it started with.
 export function createDisplaySettings({
-  file, initial, available = existsSync("/usr/bin/xsettingsd"),
-  start = () => spawn("/usr/bin/xsettingsd", ["--config=" + file], { stdio: "ignore" }), restart = 1000,
+  file, initial, available = existsSync("/usr/bin/xsettingsd") && existsSync("/usr/bin/dump_xsettings"),
+  start = () => spawn("/usr/bin/xsettingsd", ["--config=" + file], { stdio: "ignore" }),
+  published = async scale => {
+    const { stdout } = await runFile("/usr/bin/dump_xsettings", [], { timeout: 500 });
+    return densitySettings(scale).trimEnd().split("\n").every(line => stdout.split("\n").includes(line));
+  },
+  restart = 1000,
 }) {
   let scale = initial, child, timer, closed = false;
   const write = () => {
@@ -50,6 +59,24 @@ export function createDisplaySettings({
       // A manager that is being restarted reads the new file when it starts.
       child?.kill("SIGHUP");
       return scale;
+    },
+    // Writing a file or signalling a live manager does not establish that
+    // applications can read the expected density from this X server yet.
+    async waitForReady({ timeout = 3000, interval = 50 } = {}) {
+      if (!available) return false;
+      const deadline = Date.now() + timeout;
+      do {
+        if (closed) throw new Error("Display settings closed");
+        const current = child, expected = scale;
+        if (current && current.exitCode == null) {
+          try {
+            if (await published(expected) && child === current && scale === expected && current.exitCode == null) return true;
+          } catch { /* The X server or manager may still be starting. */ }
+        }
+        if (Date.now() >= deadline) break;
+        await pause(interval);
+      } while (Date.now() < deadline);
+      throw new Error("Display settings unavailable");
     },
     close() {
       closed = true;

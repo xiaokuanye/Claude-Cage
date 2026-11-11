@@ -48,13 +48,20 @@ func TestDesktopResizeScriptAppliesTheViewersDensity(t *testing.T) {
 	t.Setenv("CAGE_RESIZE_FIXTURE", root)
 	write(filepath.Join(bin, "xrandr"), "#!/bin/sh\necho \"$*\" >> \"$CAGE_RESIZE_FIXTURE/modes\"\n", 0o700)
 	// The script signals a process named xsettingsd.
-	write(filepath.Join(bin, "xsettingsd"), "#!/bin/sh\ntrap 'echo reload >> \"$CAGE_RESIZE_FIXTURE/reloads\"' HUP\nwhile :; do sleep 1 & wait $!; done\n", 0o700)
-	resize := func(scale string) string {
+	write(filepath.Join(bin, "xsettingsd"), "#!/bin/sh\ntrap 'cp \"$CAGE_RESIZE_FIXTURE/desktop/xsettings.conf\" \"$CAGE_RESIZE_FIXTURE/published\"; echo reload >> \"$CAGE_RESIZE_FIXTURE/reloads\"' HUP\nwhile :; do sleep 1 & wait $!; done\n", 0o700)
+	dump := filepath.Join(bin, "dump_xsettings")
+	publish := "#!/bin/sh\ncat \"$CAGE_RESIZE_FIXTURE/published\"\n"
+	write(dump, publish, 0o700)
+	executeResize := func(scale string) ([]byte, error) {
 		t.Helper()
-		script := strings.NewReplacer("/run/cage-desktop", desktop, "/run/cage-phone-desktop", phone).Replace(desktopResizeScript(1000, 800, scale))
+		script := strings.NewReplacer("/run/cage-desktop", desktop, "/run/cage-phone-desktop", phone, "/usr/bin/dump_xsettings", dump).Replace(desktopResizeScript(1000, 800, scale))
 		cmd := exec.Command(bash, "--noprofile", "--norc", "-c", script)
 		cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"))
-		output, err := cmd.CombinedOutput()
+		return cmd.CombinedOutput()
+	}
+	resize := func(scale string) string {
+		t.Helper()
+		output, err := executeResize(scale)
 		if err != nil {
 			t.Fatalf("resize %q: %v\n%s", scale, err, output)
 		}
@@ -120,6 +127,8 @@ func TestDesktopResizeScriptAppliesTheViewersDensity(t *testing.T) {
 
 	// While a phone holds the display the request is kept for its release.
 	write(filepath.Join(phone, "layout.json"), "{}", 0o600)
+	// The deferred path must not wait for or attempt computer DPI publication.
+	write(dump, "#!/bin/sh\necho probe >> \"$CAGE_RESIZE_FIXTURE/deferred-probes\"\nexit 1\n", 0o700)
 	modes := read(filepath.Join(root, "modes"))
 	if output := resize("1"); output != "scale 1\n" || read(filepath.Join(desktop, "desktop-size")) != "1000 800 1\n" {
 		t.Fatalf("deferred request: %q", output)
@@ -127,5 +136,53 @@ func TestDesktopResizeScriptAppliesTheViewersDensity(t *testing.T) {
 	if read(filepath.Join(desktop, "display-scale")) != "2\n" || read(filepath.Join(root, "modes")) != modes {
 		t.Fatal("a held display was changed")
 	}
+	if read(filepath.Join(root, "deferred-probes")) != "" {
+		t.Fatal("a held display was probed instead of deferring the request")
+	}
 	reloads(2)
+	if err := os.Remove(filepath.Join(phone, "layout.json")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wrong or blocked publication never acknowledges a DPI merely written to disk.
+	for _, tc := range []struct{ probe, restore string }{
+		{"#!/bin/sh\nprintf 'Xft/DPI 196608\\nGdk/WindowScalingFactor 1\\nGdk/UnscaledDPI 196608\\n'\n", "2"},
+		{"#!/bin/sh\nsleep 10\n", ""},
+	} {
+		write(dump, tc.probe, 0o700)
+		beforeModes := read(filepath.Join(root, "modes"))
+		start := time.Now()
+		output, err := executeResize("1.5")
+		if err == nil || strings.Contains(string(output), "scale 1.5") || !strings.Contains(string(output), "Desktop display settings unavailable") {
+			t.Fatalf("unpublished DPI was acknowledged: %v %q", err, output)
+		}
+		if time.Since(start) > 4*time.Second {
+			t.Fatal("publication polling exceeded its bounded timeout")
+		}
+		if read(filepath.Join(desktop, "display-scale")) != "2\n" || read(filepath.Join(root, "modes")) != beforeModes {
+			t.Fatal("failed publication changed the applied density record or framebuffer")
+		}
+		if !strings.HasPrefix(read(filepath.Join(desktop, "xsettings.conf")), "Xft/DPI 147456\n") {
+			t.Fatal("failed request did not leave the pending configuration needed by the recovery fixture")
+		}
+		// Returning to the last applied scale, explicitly or by default, must
+		// overwrite the failed request's configuration and signal its manager.
+		write(dump, publish, 0o700)
+		want := ""
+		if tc.restore != "" {
+			want = "scale " + tc.restore + "\n"
+		}
+		if output := resize(tc.restore); output != want || read(filepath.Join(desktop, "display-scale")) != "2\n" ||
+			!strings.HasPrefix(read(filepath.Join(root, "published")), "Xft/DPI 196608\n") ||
+			!strings.HasPrefix(read(filepath.Join(desktop, "xsettings.conf")), "Xft/DPI 196608\n") {
+			t.Fatalf("last applied density was not restored after publication failure: %q", output)
+		}
+	}
+	// A configured 1.5x session, like 2x, remains the fallback for older viewers.
+	write(dump, publish, 0o700)
+	write(filepath.Join(desktop, "base-display-scale"), "1.5\n", 0o600)
+	if output := resize(""); output != "" || read(filepath.Join(desktop, "display-scale")) != "1.5\n" ||
+		!strings.HasPrefix(read(filepath.Join(root, "published")), "Xft/DPI 147456\n") {
+		t.Fatalf("configured 1.5x density not restored: %q", output)
+	}
 }

@@ -57,25 +57,22 @@ fi
 printf '%s\n' "$display_scale" > "$XDG_RUNTIME_DIR/display-scale"
 printf '%s\n' "$display_scale" > "$XDG_RUNTIME_DIR/base-display-scale"
 scale_args=(--force-device-scale-factor="$display_scale")
-if command -v xsettingsd >/dev/null; then
+if [ -x /usr/bin/xsettingsd ] && [ -x /usr/bin/dump_xsettings ]; then
   dpi=$(awk -v scale="$display_scale" 'BEGIN {printf "%.0f", scale * 96 * 1024}')
   # Cage owns the embedded app's window controls; keep its native buttons hidden.
   printf 'Xft/DPI %s\nGdk/WindowScalingFactor 1\nGdk/UnscaledDPI %s\nGtk/DecorationLayout ":"\n' "$dpi" "$dpi" > "$XDG_RUNTIME_DIR/xsettings.conf"
-  xsettingsd --config="$XDG_RUNTIME_DIR/xsettings.conf" &
-  printf '%s\n' "$!" > "$XDG_RUNTIME_DIR/xsettings.pid"
-  /usr/bin/python3 - <<'CAGE_DESKTOP_DPI_READY'
-import time
-from Xlib import display
-connection = display.Display()
-selection = connection.intern_atom('_XSETTINGS_S0')
-for attempt in range(60):
-    if connection.get_selection_owner(selection):
-        break
-    time.sleep(.05)
-else:
-    raise RuntimeError('Desktop display settings unavailable')
-connection.close()
-CAGE_DESKTOP_DPI_READY
+  /usr/bin/xsettingsd --config="$XDG_RUNTIME_DIR/xsettings.conf" &
+  settings_pid=$!
+  settings_deadline=$((SECONDS + 4))
+  for i in $(seq 1 60); do
+    kill -0 "$settings_pid"
+    if /usr/bin/timeout .5 /usr/bin/dump_xsettings 2>/dev/null | grep -Fx "Xft/DPI $dpi" >/dev/null; then break; fi
+    if [ "$SECONDS" -ge "$settings_deadline" ]; then break; fi
+    sleep .05
+  done
+  kill -0 "$settings_pid"
+  /usr/bin/timeout .5 /usr/bin/dump_xsettings | grep -Fx "Xft/DPI $dpi" >/dev/null
+  printf '%s\n' "$settings_pid" > "$XDG_RUNTIME_DIR/xsettings.pid"
   scale_args=()
 fi
 /usr/local/bin/cage-desktop-files &

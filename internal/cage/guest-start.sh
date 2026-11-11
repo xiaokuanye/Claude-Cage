@@ -29,7 +29,7 @@ d=json.loads(p.read_text()) if p.exists() else {'token':secrets.token_hex(32)}
 scale = 1.5 if os.environ['CAGE_DISPLAY_SCALE'] == '1.5' else 2
 d['display_scale'] = scale
 # With a settings manager each viewer chooses the density of its own screen.
-d['dynamic_scale'] = os.path.exists('/usr/bin/xsettingsd')
+d['dynamic_scale'] = all(os.access(tool, os.X_OK) for tool in ('/usr/bin/xsettingsd', '/usr/bin/dump_xsettings'))
 scale_file = Path('/etc/claude-cage/display-scale')
 scale_file.write_text(str(scale) + '\n')
 scale_file.chmod(0o644)

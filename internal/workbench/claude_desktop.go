@@ -198,7 +198,10 @@ printf '%s\n' "$password"
 if test -f /run/cage-desktop/base-display-scale; then cat /run/cage-desktop/base-display-scale
 elif test -f /run/cage-desktop/display-scale; then cat /run/cage-desktop/display-scale
 else echo; fi
-if test -f /run/cage-desktop/xsettings.pid; then echo dynamic; fi`)
+if test -x /usr/bin/dump_xsettings && test -f /run/cage-desktop/xsettings.pid; then
+  manager=$(cat /run/cage-desktop/xsettings.pid)
+  if test "$(cat "/proc/$manager/comm" 2>/dev/null)" = xsettingsd; then echo dynamic; fi
+fi`)
 	password, scale, _ := strings.Cut(strings.TrimSpace(string(b)), "\n")
 	if err != nil || len(password) != 8 {
 		http.Error(w, "Claude Desktop 尚未启动", 409)
@@ -278,16 +281,39 @@ fi
 scale=
 if test -n "$manager"; then
   scale=${requested:-$(cat /run/cage-desktop/base-display-scale 2>/dev/null || echo 2)}
-  if test -n "$requested"; then echo "scale $scale"; fi
 fi
 printf '%%s %%s %%s\n' %d %d "$scale" > /run/cage-desktop/desktop-size
 # A phone holds the display. Its release applies this size and density.
-if test -f /run/cage-phone-desktop/layout.json; then exit 0; fi
-if test -n "$manager" && test "$(cat /run/cage-desktop/display-scale 2>/dev/null)" != "$scale"; then
+if test -f /run/cage-phone-desktop/layout.json; then
+  if test -n "$manager" && test -n "$requested"; then echo "scale $scale"; fi
+  exit 0
+fi
+if test -n "$manager"; then
   dpi=$(awk -v scale="$scale" 'BEGIN {printf "%%.0f", scale * 96 * 1024}')
-  printf 'Xft/DPI %%s\nGdk/WindowScalingFactor 1\nGdk/UnscaledDPI %%s\nGtk/DecorationLayout ":"\n' "$dpi" "$dpi" > /run/cage-desktop/xsettings.conf.new
-  mv /run/cage-desktop/xsettings.conf.new /run/cage-desktop/xsettings.conf
-  kill -HUP "$manager"
+  desired_settings=$(printf 'Xft/DPI %%s\nGdk/WindowScalingFactor 1\nGdk/UnscaledDPI %%s\nGtk/DecorationLayout ":"\n' "$dpi" "$dpi")
+  # A timed-out request may have changed the configuration without changing
+  # display-scale. Restore it even when the viewer asks for that old density.
+  if test "$(cat /run/cage-desktop/display-scale 2>/dev/null)" != "$scale" ||
+    test "$(cat /run/cage-desktop/xsettings.conf 2>/dev/null)" != "$desired_settings"; then
+    printf '%%s\n' "$desired_settings" > /run/cage-desktop/xsettings.conf.new
+    mv /run/cage-desktop/xsettings.conf.new /run/cage-desktop/xsettings.conf
+    kill -HUP "$manager"
+  fi
+  # Bound the complete publication poll as well as each X server query.
+  if ! /usr/bin/timeout 2 /bin/bash --noprofile --norc -c '
+    while kill -0 "$1" 2>/dev/null; do
+      if settings=$(/usr/bin/timeout .25 /usr/bin/dump_xsettings 2>/dev/null) &&
+        printf "%%s\n" "$settings" | grep -Fx "Xft/DPI $2" >/dev/null &&
+        printf "%%s\n" "$settings" | grep -Fx "Gdk/UnscaledDPI $2" >/dev/null &&
+        printf "%%s\n" "$settings" | grep -Fx "Gdk/WindowScalingFactor 1" >/dev/null &&
+        kill -0 "$1" 2>/dev/null; then exit 0; fi
+      sleep .05
+    done
+    exit 1
+  ' -- "$manager" "$dpi"; then
+    echo "Desktop display settings unavailable" >&2
+    exit 1
+  fi
   printf '%%s\n' "$scale" > /run/cage-desktop/display-scale
 fi
 name=cage-%dx%d
@@ -298,7 +324,8 @@ fi
 xrandr --output VNC-0 --mode "$name"
 for old in $(xrandr --query | awk '/^ +cage-/ {print $1}'); do
   if [ "$old" != "$name" ]; then xrandr --delmode VNC-0 "$old"; xrandr --rmmode "$old"; fi
-done`, scale, wid, hei, wid, hei, float64((wid+32)*(hei+8)*60)/1000000, wid, wid+8, wid+16, wid+32, hei, hei+1, hei+2, hei+8)
+done
+if test -n "$manager" && test -n "$requested"; then echo "scale $scale"; fi`, scale, wid, hei, wid, hei, float64((wid+32)*(hei+8)*60)/1000000, wid, wid+8, wid+16, wid+32, hei, hei+1, hei+2, hei+8)
 }
 
 func (s *Server) claudeDesktopVNC(w http.ResponseWriter, r *http.Request) {

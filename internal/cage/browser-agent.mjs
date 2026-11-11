@@ -27,6 +27,7 @@ const displayScale = config.display_scale === 1.5 ? 1.5 : 2;
 // Started before Chromium, which then opens at this density.
 const displaySettings = createDisplaySettings({ file: "/home/cage-browser/.cache/cage-display/xsettings.conf", initial: displayScale });
 process.on("exit", () => displaySettings.close());
+await displaySettings.waitForReady();
 const selectionFile = "/home/cage-browser/workbench-state.json";
 const homepageFile = "/home/cage-browser/homepage.json";
 let homeURL = "https://www.bing.com/";
@@ -657,7 +658,9 @@ async function resizeDisplay(width, height, density) {
     height > 8192
   )
     throw new Error("Invalid display size");
-  const result = { ok: true, ...(displaySettings.available ? { scale: displaySettings.set(scale) } : {}) };
+  displaySettings.set(scale);
+  await displaySettings.waitForReady();
+  const result = { ok: true, ...(displaySettings.available ? { scale: displaySettings.scale } : {}) };
   const name = `cage-${width}x${height}`;
   if (displaySize === name) {
     // A viewer attaching at an unchanged size still restores the full rate.
